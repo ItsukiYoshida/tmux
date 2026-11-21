@@ -5290,6 +5290,14 @@ mouse sequences.
 Supports the OSC 7 working directory extension.
 .It overline
 Supports the overline SGR attribute.
+.It pasteevents
+Sends kitty clipboard protocol (OSC 5522) paste events.
+.Nm
+reads plain text from the clipboard and pastes it as usual, or, if the
+clipboard holds a PNG image but no plain text, saves the image to a new file
+under
+.Pa /tmp
+and pastes its path.
 .It progressbar
 Supports the OSC 9;4 progress bar extension.
 .It rectfill

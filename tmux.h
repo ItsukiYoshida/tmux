@@ -468,6 +468,7 @@ enum {
 	KEYC_REPORT_COLOURS,
 	KEYC_REPORT_PALETTE,
 	KEYC_REPORT_WINSZ,
+	KEYC_REPORT_PASTE_EVENT,
 
 	/* Mouse state. */
 	KEYC_MOUSE, /* unclassified mouse event */
@@ -526,6 +527,7 @@ enum tty_code_code {
 	TTYC_DSESC,
 	TTYC_DSFCS,
 	TTYC_DSMG,
+	TTYC_DSPE,
 	TTYC_E3,
 	TTYC_ECH,
 	TTYC_ED,
@@ -537,6 +539,7 @@ enum tty_code_code {
 	TTYC_ENESC,
 	TTYC_ENFCS,
 	TTYC_ENMG,
+	TTYC_ENPE,
 	TTYC_FSL,
 	TTYC_HLS,
 	TTYC_HOME,
@@ -1943,6 +1946,21 @@ struct tty {
 	uint64_t	 scroll_generation;
 	int		 scroll_failed;
 
+	/* Kitty clipboard (OSC 5522) paste event in progress. */
+	enum {
+		TTY_PASTE_NONE,
+		TTY_PASTE_LISTING,
+		TTY_PASTE_REQUESTED,
+		TTY_PASTE_READING,
+		TTY_PASTE_READY
+	}		 paste_state;
+	char		*paste_pw;
+	int		 paste_primary;
+	int		 paste_image;
+	char		*paste_mime;
+	struct evbuffer	*paste_data;
+	struct event	 paste_timer;
+
 #ifdef ENABLE_IMAGES
 	struct image_backend	*image_backend;
 	void			*image_data;
@@ -3155,6 +3173,7 @@ const struct utf8_data *tty_acs_rounded_borders(int);
 void		tty_keys_build(struct tty *);
 void		tty_keys_free(struct tty *);
 int		tty_keys_next(struct tty *);
+void		tty_keys_paste_reset(struct tty *);
 int		tty_keys_colours(struct tty *, const char *, size_t, size_t *,
 		     int *, int *);
 

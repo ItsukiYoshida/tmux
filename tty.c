@@ -404,6 +404,8 @@ tty_start_tty(struct tty *tty)
 	}
 	if (tty_term_has(tty->term, TTYC_ENBP))
 		tty_putcode(tty, TTYC_ENBP);
+	if (tty_term_has(tty->term, TTYC_ENPE))
+		tty_putcode(tty, TTYC_ENPE);
 	if (tty->term->flags & TERM_VT100LIKE)
 		tty_puts(tty, "\033[?2031h\033[?996n");
 
@@ -537,6 +539,8 @@ tty_stop_tty(struct tty *tty)
 	}
 	if (tty_term_has(tty->term, TTYC_DSBP))
 		tty_raw(tty, tty_term_string(tty->term, TTYC_DSBP));
+	if (tty_term_has(tty->term, TTYC_DSPE))
+		tty_raw(tty, tty_term_string(tty->term, TTYC_DSPE));
 
 	tty_raw(tty, tty_term_string(tty->term, TTYC_DSESC));
 	tty_raw(tty, tty_term_string(tty->term, TTYC_DSFCS));
@@ -577,6 +581,7 @@ tty_close(struct tty *tty)
 
 		tty_term_free(tty->term);
 		tty_keys_free(tty);
+		tty_keys_paste_reset(tty);
 
 		tty->flags &= ~TTY_OPENED;
 	}
@@ -612,6 +617,7 @@ tty_update_features(struct tty *tty)
 		tty_puts(tty, tty_term_string(tty->term, TTYC_ENEKS));
 	if (options_get_number(global_options, "focus-events"))
 		tty_puts(tty, tty_term_string(tty->term, TTYC_ENFCS));
+	tty_puts(tty, tty_term_string(tty->term, TTYC_ENPE));
 	tty_puts(tty, tty_term_string(tty->term, TTYC_ENESC));
 
 	if (changed) {
