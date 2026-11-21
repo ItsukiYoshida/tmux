@@ -22,6 +22,7 @@
 #include <netinet/in.h>
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <resolv.h>
 #include <stdlib.h>
@@ -65,6 +66,8 @@ static int	tty_keys_mouse(struct tty *, const char *, size_t, size_t *,
 		    struct mouse_event *);
 static int	tty_keys_clipboard(struct tty *, const char *, size_t,
 		    size_t *, int);
+static int	tty_keys_paste_event(struct tty *, const char *, size_t,
+		    size_t *, int);
 static int	tty_keys_device_attributes(struct tty *, const char *, size_t,
 		    size_t *, int);
 static int	tty_keys_device_attributes2(struct tty *, const char *, size_t,
@@ -92,6 +95,7 @@ static const struct {
 	int	      (*fn)(struct tty *, const char *, size_t, size_t *, int);
 } tty_keys_replies[] = {
 	{ KEYC_REPORT_CLIPBOARD, tty_keys_clipboard },
+	{ KEYC_REPORT_PASTE_EVENT, tty_keys_paste_event },
 	{ KEYC_REPORT_SYNC, tty_keys_sync },
 	{ KEYC_REPORT_DA, tty_keys_device_attributes },
 	{ KEYC_REPORT_DA2, tty_keys_device_attributes2 },
@@ -947,7 +951,8 @@ partial_key:
 	if (tty->flags & (TTY_WAITFG|TTY_WAITBG|TTY_OSC52QUERY) ||
 	    tty->flags & (TTY_WINSZQUERY|TTY_WINSZPIXELS) ||
 	    (tty->flags & TTY_ALL_REQUEST_FLAGS) != TTY_ALL_REQUEST_FLAGS ||
-	    !TAILQ_EMPTY(&c->input_requests)) {
+	    !TAILQ_EMPTY(&c->input_requests) ||
+	    tty->paste_state != TTY_PASTE_NONE) {
 		log_debug("%s: increasing delay (active query)", c->name);
 		if (delay < 500)
 			delay = 500;
@@ -1011,6 +1016,12 @@ complete_key:
 
 	/* Remove data from buffer. */
 	evbuffer_drain(tty->in, kp.size);
+
+	/* Insert a completed paste event before the rest of the input. */
+	if (tty->paste_state == TTY_PASTE_READY) {
+		evbuffer_prepend_buffer(tty->in, tty->paste_data);
+		tty_keys_paste_reset(tty);
+	}
 
 	return (1);
 }
@@ -1402,6 +1413,289 @@ tty_keys_clipboard(struct tty *tty, const char *buf, size_t len, size_t *size,
 	}
 
 	free(out);
+	return (0);
+}
+
+/* Forget any paste event in progress. */
+void
+tty_keys_paste_reset(struct tty *tty)
+{
+	if (event_initialized(&tty->paste_timer))
+		evtimer_del(&tty->paste_timer);
+	free(tty->paste_pw);
+	tty->paste_pw = NULL;
+	free(tty->paste_mime);
+	tty->paste_mime = NULL;
+	if (tty->paste_data != NULL)
+		evbuffer_free(tty->paste_data);
+	tty->paste_data = NULL;
+	tty->paste_state = TTY_PASTE_NONE;
+}
+
+/* Give up on a paste event if the terminal stops sending it. */
+static void
+tty_keys_paste_timer(__unused int fd, __unused short events, void *data)
+{
+	struct tty	*tty = data;
+
+	log_debug("%s: paste event timed out", tty->client->name);
+	tty_keys_paste_reset(tty);
+}
+
+/* Ask the terminal for the preferred type offered by a paste event. */
+static void
+tty_keys_paste_request(struct tty *tty)
+{
+	size_t	 len = EVBUFFER_LENGTH(tty->paste_data), size;
+	char	*list, *next, *cp, *text = NULL, *image = NULL, *mime, *s;
+
+	list = xmalloc(len + 1);
+	memcpy(list, EVBUFFER_DATA(tty->paste_data), len);
+	list[len] = '\0';
+	next = list;
+	while ((cp = strsep(&next, " \t\r\n")) != NULL) {
+		if (text == NULL &&
+		    strncmp(cp, "text/plain", 10) == 0 &&
+		    (cp[10] == '\0' || cp[10] == ';'))
+			text = cp;
+		else if (strcmp(cp, "image/png") == 0)
+			image = cp;
+	}
+
+	/*
+	 * Prefer text, because applications often put a picture of copied
+	 * text (such as spreadsheet cells) on the clipboard as well.
+	 */
+	mime = (text != NULL) ? text : image;
+	if (mime == NULL) {
+		log_debug("%s: no usable type in paste event: %s",
+		    tty->client->name, list);
+		free(list);
+		tty_keys_paste_reset(tty);
+		return;
+	}
+	tty->paste_image = (mime == image);
+
+	size = 4 * ((strlen(mime) + 2) / 3) + 1;
+	tty->paste_mime = xmalloc(size);
+	b64_ntop(mime, strlen(mime), tty->paste_mime, size);
+	free(list);
+
+	xasprintf(&s, "\033]5522;type=read%s%s%s%s;%s\033\\",
+	    tty->paste_primary ? ":loc=primary" : "",
+	    tty->paste_pw != NULL ? ":pw=" : "",
+	    tty->paste_pw != NULL ? tty->paste_pw : "",
+	    tty->paste_pw != NULL ? ":name=UGFzdGUgZXZlbnQ=" : "",
+	    tty->paste_mime);
+	tty_puts(tty, s);
+	free(s);
+
+	evbuffer_drain(tty->paste_data, len);
+	tty->paste_state = TTY_PASTE_REQUESTED;
+}
+
+/* Save pasted PNG data to a new file and return its path. */
+static char *
+tty_keys_paste_save(const u_char *data, size_t len)
+{
+	char	 dir[] = _PATH_TMP "tmux-paste-XXXXXXXX", *path;
+	FILE	*f;
+	int	 fd;
+
+	if (mkdtemp(dir) == NULL)
+		return (NULL);
+	xasprintf(&path, "%s/paste.png", dir);
+	if ((fd = open(path, O_WRONLY|O_CREAT|O_EXCL, 0600)) == -1)
+		goto fail;
+	if ((f = fdopen(fd, "w")) == NULL) {
+		close(fd);
+		goto fail;
+	}
+	if (fwrite(data, 1, len, f) != len) {
+		fclose(f);
+		goto fail;
+	}
+	if (fclose(f) != 0)
+		goto fail;
+	return (path);
+
+fail:
+	unlink(path);
+	rmdir(dir);
+	free(path);
+	return (NULL);
+}
+
+/*
+ * Turn the data read for a paste event into a bracketed paste: the text
+ * itself, or the path of a file holding the image.
+ */
+static void
+tty_keys_paste_finish(struct tty *tty)
+{
+	static const char	 end[] = "\033[201~";
+	size_t			 elen = (sizeof end) - 1, len, i, start;
+	const u_char		*data;
+	struct evbuffer		*out;
+	char			*path;
+
+	len = EVBUFFER_LENGTH(tty->paste_data);
+	if (len == 0) {
+		tty_keys_paste_reset(tty);
+		return;
+	}
+	data = EVBUFFER_DATA(tty->paste_data);
+
+	out = evbuffer_new();
+	if (out == NULL)
+		fatalx("out of memory");
+	evbuffer_add(out, "\033[200~", 6);
+	if (tty->paste_image) {
+		if ((path = tty_keys_paste_save(data, len)) == NULL) {
+			log_debug("%s: failed to save pasted image",
+			    tty->client->name);
+			evbuffer_free(out);
+			tty_keys_paste_reset(tty);
+			return;
+		}
+		evbuffer_add(out, path, strlen(path));
+		free(path);
+	} else {
+		/* Remove paste ends so the text cannot end the paste early. */
+		for (i = start = 0; i + elen <= len; /* nothing */) {
+			if (memcmp(data + i, end, elen) == 0) {
+				evbuffer_add(out, data + start, i - start);
+				i += elen;
+				start = i;
+			} else
+				i++;
+		}
+		evbuffer_add(out, data + start, len - start);
+	}
+	evbuffer_add(out, end, elen);
+
+	evbuffer_free(tty->paste_data);
+	tty->paste_data = out;
+	tty->paste_state = TTY_PASTE_READY;
+}
+
+/*
+ * Handle a kitty clipboard (OSC 5522) paste event or the reply to the read
+ * request for it. Returns 0 for success, -1 for failure, 1 for partial.
+ */
+static int
+tty_keys_paste_event(struct tty *tty, const char *buf, size_t len,
+    size_t *size, int apply)
+{
+	static const char	 prefix[] = "\033]5522;";
+	size_t			 plen = (sizeof prefix) - 1, end, n;
+	char			*copy, *payload, *next, *cp, *value;
+	char			*type = NULL, *status = NULL, *mime = NULL;
+	char			*pw = NULL, *loc = NULL;
+	u_char			*out;
+	int			 outlen;
+	struct timeval		 tv = { .tv_sec = 5 };
+
+	*size = 0;
+	if (memcmp(buf, prefix, len < plen ? len : plen) != 0)
+		return (-1);
+	if (len <= plen)
+		return (1);
+
+	/* Find the terminator if any. */
+	for (end = plen; end < len; end++) {
+		if (buf[end] == '\007')
+			break;
+		if (buf[end - 1] == '\033' && buf[end] == '\\')
+			break;
+	}
+	if (end == len)
+		return (1);
+	*size = end + 1;
+	if (!apply)
+		return (0);
+
+	/* Split into metadata and payload, without the terminator. */
+	n = end - plen;
+	if (buf[end] == '\\')
+		n--;
+	copy = xmalloc(n + 1);
+	memcpy(copy, buf + plen, n);
+	copy[n] = '\0';
+	if ((payload = strchr(copy, ';')) != NULL)
+		*payload++ = '\0';
+	next = copy;
+	while ((cp = strsep(&next, ":")) != NULL) {
+		if ((value = strchr(cp, '=')) == NULL)
+			continue;
+		*value++ = '\0';
+		if (strcmp(cp, "type") == 0)
+			type = value;
+		else if (strcmp(cp, "status") == 0)
+			status = value;
+		else if (strcmp(cp, "mime") == 0)
+			mime = value;
+		else if (strcmp(cp, "pw") == 0)
+			pw = value;
+		else if (strcmp(cp, "loc") == 0)
+			loc = value;
+	}
+	if (type == NULL || strcmp(type, "read") != 0 || status == NULL)
+		goto out;
+	log_debug("%s: paste event %s (state %d)", tty->client->name, status,
+	    tty->paste_state);
+
+	if (strcmp(status, "OK") == 0) {
+		if (tty->paste_state == TTY_PASTE_REQUESTED)
+			tty->paste_state = TTY_PASTE_READING;
+		else {
+			/* Anything else starts a new paste event. */
+			tty_keys_paste_reset(tty);
+			tty->paste_state = TTY_PASTE_LISTING;
+			if (pw != NULL)
+				tty->paste_pw = xstrdup(pw);
+			tty->paste_primary = (loc != NULL &&
+			    strcmp(loc, "primary") == 0);
+			tty->paste_data = evbuffer_new();
+			if (tty->paste_data == NULL)
+				fatalx("out of memory");
+		}
+	} else if (strcmp(status, "DATA") == 0) {
+		if (mime == NULL || payload == NULL)
+			goto out;
+		if ((tty->paste_state == TTY_PASTE_LISTING &&
+		    strcmp(mime, "Lg==") == 0) ||
+		    (tty->paste_state == TTY_PASTE_READING &&
+		    strcmp(mime, tty->paste_mime) == 0)) {
+			n = (strlen(payload) / 4) * 3 + 3;
+			out = xmalloc(n);
+			if ((outlen = b64_pton(payload, out, n)) == -1)
+				tty_keys_paste_reset(tty);
+			else
+				evbuffer_add(tty->paste_data, out, outlen);
+			free(out);
+		}
+	} else if (strcmp(status, "DONE") == 0) {
+		if (tty->paste_state == TTY_PASTE_LISTING)
+			tty_keys_paste_request(tty);
+		else if (tty->paste_state == TTY_PASTE_READING)
+			tty_keys_paste_finish(tty);
+	} else {
+		/* An error such as EPERM ends the paste event. */
+		tty_keys_paste_reset(tty);
+	}
+
+	if (tty->paste_state != TTY_PASTE_NONE &&
+	    tty->paste_state != TTY_PASTE_READY) {
+		if (!event_initialized(&tty->paste_timer)) {
+			evtimer_set(&tty->paste_timer, tty_keys_paste_timer,
+			    tty);
+		}
+		evtimer_add(&tty->paste_timer, &tv);
+	}
+
+out:
+	free(copy);
 	return (0);
 }
 

@@ -398,6 +398,18 @@ static const struct tty_feature tty_feature_progressbar = {
 	0
 };
 
+/* Terminal sends kitty clipboard (OSC 5522) paste events. */
+static const char *const tty_feature_pasteevents_capabilities[] = {
+	"Enpe=\\E[?5522h",
+	"Dspe=\\E[?5522l",
+	NULL
+};
+static const struct tty_feature tty_feature_pasteevents = {
+	"pasteevents",
+	tty_feature_pasteevents_capabilities,
+	0
+};
+
 /* Terminal supports UTF-8. */
 static const struct tty_feature tty_feature_utf8 = {
 	"utf8",
@@ -423,6 +435,7 @@ static const struct tty_feature *const tty_features[] = {
 	&tty_feature_mouse,
 	&tty_feature_osc7,
 	&tty_feature_overline,
+	&tty_feature_pasteevents,
 	&tty_feature_progressbar,
 	&tty_feature_rectfill,
 	&tty_feature_rgb,
@@ -677,7 +690,8 @@ tty_default_features(struct client *c, const char *name, u_int version)
 			      "sync,"
 			      "usstyle,"
 			      "progressbar,"
-			      "kittygraphics"
+			      "kittygraphics,"
+			      "pasteevents"
 		},
 		{ .name = "kitty",
 		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
@@ -691,7 +705,8 @@ tty_default_features(struct client *c, const char *name, u_int version)
 			      "progressbar,"
 			      "sync,"
 			      "usstyle,"
-			      "kittygraphics"
+			      "kittygraphics,"
+			      "pasteevents"
 		},
 		{ .name = "Rio",
 		  .features = TTY_FEATURES_BASE_MODERN_XTERM ","
