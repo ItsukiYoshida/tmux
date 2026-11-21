@@ -1449,7 +1449,9 @@ tty_keys_paste_request(struct tty *tty)
 	size_t	 len = EVBUFFER_LENGTH(tty->paste_data), size;
 	char	*list, *next, *cp, *text = NULL, *image = NULL, *mime, *s;
 
-	list = xstrndup(EVBUFFER_DATA(tty->paste_data), len);
+	list = xmalloc(len + 1);
+	memcpy(list, EVBUFFER_DATA(tty->paste_data), len);
+	list[len] = '\0';
 	next = list;
 	while ((cp = strsep(&next, " \t\r\n")) != NULL) {
 		if (text == NULL &&
@@ -1617,7 +1619,9 @@ tty_keys_paste_event(struct tty *tty, const char *buf, size_t len,
 	n = end - plen;
 	if (buf[end] == '\\')
 		n--;
-	copy = xstrndup(buf + plen, n);
+	copy = xmalloc(n + 1);
+	memcpy(copy, buf + plen, n);
+	copy[n] = '\0';
 	if ((payload = strchr(copy, ';')) != NULL)
 		*payload++ = '\0';
 	next = copy;
